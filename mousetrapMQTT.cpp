@@ -57,13 +57,7 @@ void publishThingSpeakData(int count, ...) {
     va_arg(ap, double); //Requires the type to cast to. Increments ap to the next argument.
   va_end(ap);
 }
-/*JsonObject getMyESPConfig() {
-  String configTopic = "/ESP/" + getShortName() + "/Config";
-  client.subscribe(configTopic);
-  // JsonObject& root = jsonBuffer.parseObject((char *)payload);
-  return null;
-}
-*/
+
 
 
 

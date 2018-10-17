@@ -28,6 +28,14 @@
 
 #include "mousetrapMQTT.h"
 
+typedef enum {
+  SLEEP_MODE_POLL = 1,
+  SLEEP_MODE_EXT0 = 2,
+  SLEEP_MODE_EXT1 = 3,
+  SLEEP_MODE_FULL_WAKE_POLL = 4,
+} sleepMode_t;
+
+
 extern "C" int rom_phy_get_vdd33();
 uint8_t remoteMac[] = {'r', 'P', 'i', 'N', 'o', 'w'}; // {0x30, 0xAE, 0xA4, 0x01, 0x42, 0x95};
 
@@ -53,7 +61,17 @@ Author:
 Pranav Cherukupalli <cherukupallip@gmail.com>
 */
 
-// prototypes
+// prototypes and externs
+extern RTC_DATA_ATTR int stubWakeCount;
+extern RTC_DATA_ATTR uint64_t stubCumulativeWakeTimeMicros;
+extern RTC_DATA_ATTR uint32_t stubPollTimeSecs;
+extern RTC_DATA_ATTR gpio_num_t inputPin;
+extern RTC_DATA_ATTR gpio_num_t outputPin;
+extern RTC_DATA_ATTR gpio_num_t ledPin; 
+extern RTC_DATA_ATTR boolean debugWakeStub;
+extern RTC_DATA_ATTR boolean flushUARTAtEndOfWakeStub;
+
+
 String  sendSecureThingSpeak(int field1, int field2, int field3, int field4, int, int, int lastWakeDurationMs, uint32_t cumulativeWakeTimeMs);
 String  sendThingSpeakMQTT(char const *channelId, char const *apiKey,int bootCount,int inReading,int ADCbatReading,int internalBatReading,
     int connectTimeMillis, int wifiRSSI,int lastWakeDurationMs,uint32_t cumulativeWakeTimeMs) ;
@@ -61,13 +79,17 @@ String  sendThingSpeakMQTT(char const *channelId, char const *apiKey,int bootCou
 String sendSecurePushover(const char * title, const char * msg);
 int  readBatteryRaw();
 int initWiFi();
+static char const *getLocalDomain();
 void setupArduinoOTA();
-void updateConfigFromPi();
+boolean updateConfigFromPi();
 // void handleWiFiFail(const char *msg);
-void gotoSleepForSeconds(int seconds, const char *reason);
-
-
-
+void gotoSleepForSeconds(int seconds, const char *reason, sleepMode_t mode);
+extern "C" void wakeStubDoPreCalculations(); // in wakestub.c MUST BE CALLED
+extern "C" boolean RTC_IRAM_ATTR arePinsConnected(gpio_num_t in, gpio_num_t out); // in wakestub.c
+extern "C" boolean RTC_IRAM_ATTR should_stub_wake_fully(); // for wakestub to call
+extern "C" boolean RTC_IRAM_ATTR getCurrentState(int mode); 
+extern "C" int RTC_IRAM_ATTR RTCIRAM_readGPIO(gpio_num_t gpioNum);
+boolean getCurrentStateMAIN(); 
 
 unsigned long startTimeMillis; // initialized in setup
 
@@ -112,37 +134,56 @@ String baseTopicString; // to pin it in memory
 // RTC_DATA_ATTR = RTC Slow Memory 
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR int lastState;
+RTC_DATA_ATTR int lastPinsConnectedState;
 RTC_DATA_ATTR int lastWakeDurationMs = 0;
 RTC_DATA_ATTR uint32_t cumulativeWakeTimeMs = 0; // 31 bits of milliseconds = roughly 600 hours
-RTC_DATA_ATTR boolean settingsRetrieved = false;
+RTC_DATA_ATTR uint32_t wakeFromStubAt;
 
 
 // need to work out how to persist this for ESP_NOW
 // in that mode it could use wifi and read on "boot", then use the persisted version
 // this would reduce WiFi usage and still allows for configuration (at boot time)
 struct Config {
+  boolean configFromPi;
   boolean sendThingSpeak;
-  boolean sendPushover;
   char *thingspeakKey;
   char *thingspeakChannel;
+  
+  boolean sendPushover;
+  
+  sleepMode_t sleepMode; // TODO should be an enum!
   int sleepTimeMins;
+  int pollIntervalSecs; // if using wakestub, poll this often, will still wake after (approx) sleepTimeMins
   int lingerSeconds; // stay awake after sending message for this long, used when I want to OTA
+  
   uint16_t espNowRetries; 
+  
   gpio_num_t inPin;
   int inPinMode;
+  gpio_num_t outPin;
+
+  boolean debugWakeStub;
+  boolean flushUARTAtEndOfWakeStub;
 };
 RTC_DATA_ATTR Config config = { 
+    .configFromPi = false,
     .sendThingSpeak = SEND_THINGSPEAK, 
-    .sendPushover= SEND_PUSHOVER,
     .thingspeakKey= strdup("Key-Not-Set"),
     .thingspeakChannel= strdup("Channel-Not-Set"),
+    .sendPushover= SEND_PUSHOVER,
+    .sleepMode = SLEEP_MODE_EXT0,
     .sleepTimeMins = 10, //short time initially while testing // 2*60,
-    .lingerSeconds = 0,
+    .pollIntervalSecs = 5, // really short!
+    .lingerSeconds = 0, // time to wait before going into deep sleep (gives OTA a chance)
     .espNowRetries = 5,
     .inPin = GPIO_NUM_2, // default to GPIO 2 for mousetraps, can be overriden by Pi Settings
                         // for the postbox it is GPIO_NUM_36
                         // "output pin" is GPIO_NUM_32 - though not used for the postbox
-    .inPinMode = INPUT_PULLUP
+    .inPinMode = INPUT_PULLUP,
+    .outPin = GPIO_NUM_MAX, // MAX is "disabled", 15 & 13 are typically "terminals" on the mouse traps
+
+    .debugWakeStub = false,
+    .flushUARTAtEndOfWakeStub = false,
     };
 
 
@@ -192,14 +233,20 @@ void setup() {
   boolean thingSpeakSuccess = false;
   boolean pushoverSuccess = false;
   unsigned long mqttTimeMillis =0;
-  unsigned long wifiTimeMillis =0;
   unsigned long getConfigFromPiMillis = 0;
   unsigned long thingspeakTimeMillis = 0;
 
 
   timingPointA = startTimeMillis= millis();
   Serial.begin(115200);
+  Serial.printf("configuring inPin %d to mode %d\n", config.inPin, config.inPinMode);
+  if (config.flushUARTAtEndOfWakeStub) {
+    Serial.flush();
+  }
   pinMode(config.inPin, config.inPinMode); 
+  inputPin = config.inPin;
+  outputPin = config.outPin;
+  
   pinMode(LED, OUTPUT);
 
   
@@ -209,7 +256,7 @@ void setup() {
   ++bootCount;
   esp_sleep_wakeup_cause_t wakeup_reason = print_wakeup_reason();
   // Check GPIO status pin 23 is connected to Ground when mousetrap is "ready"
-  int inReading = digitalRead(config.inPin);
+  int inReading = getCurrentStateMAIN(config.sleepMode);
   int rawBatReading = readBatteryRaw();
   int internalBatReading = getInternalVdd33Adjusted(rawBatReading);
   int ADCbatReading = analogRead(A6);
@@ -228,16 +275,17 @@ void setup() {
     sourceFile++; // skip over the '/'
   }
   
-  S.println("Boot number: " + String(bootCount));
+  S.printf("Full Boot number: %d\n",bootCount);
+  S.printf("Stub Boot number: %d\n", stubWakeCount);
   S.printf("File Timestamp is %s\n", __TIMESTAMP__);
   S.printf("Full Path is %s\n", __FILE__);
   S.printf("File Name is %s\n", sourceFile == 0L ? "null" : sourceFile);
   S.printf("Mousetrap state is %s (%d), last state was %d\n", inReading ? "Trap has Sprung": "Trap is Set", inReading, lastState);
   S.printf("scaled battery reading (before wifi) is %d, unScaled %d\n",internalBatReading, rawBatReading);
-  S.printf("raw battery Reading (io34/A6) is %d, internal Reading: %d\n", ADCbatReading, internalBatReading);
+  S.printf("ADC battery Reading (io34/A6) is %d, internal raw Reading: %d\n", ADCbatReading, rawBatReading);
   S.printf("topicBase is %s\n", topicBase.c_str());
-
-
+  S.printf("wakeStub cumulative time micros %llu\n", stubCumulativeWakeTimeMicros);
+  printConfig();
 
 
 
@@ -245,11 +293,11 @@ void setup() {
   WiFi.mode(WIFI_STA); // required because otherwise it aint setup!
   WiFi.setAutoConnect(false);
   if (!initESPNOWSenderTo(remoteMac)) {
-    gotoSleepForSeconds(15*60,"ESPNow failed to initialize, might try again in 15 minutes");    
+    gotoSleepForSeconds(15*60,"ESPNow failed to initialize, might try again in 15 minutes", SLEEP_MODE_FULL_WAKE_POLL);    
   }
   ESPNOWSetRetryLimit(config.espNowRetries);
   setESPNOWDefaultBaseMQTTTopic((String("/ESP/") + getShortName()).c_str());
-  char const *baseTopic = getESPNOWDefaultBaseMQTTTopic();
+  // char const *baseTopic = getESPNOWDefaultBaseMQTTTopic();
   // tbhis will work because WiFi is not connected, so won't be to a random channel
   sendESPNOWMQTT("boot", "booted");
 
@@ -264,12 +312,12 @@ void setup() {
 // turn the LED on for a second to show we're awake or blink while connecting to WiFi
 digitalWrite(LED, LOW);
 // if we haven't got any settings, then ALWAYS connect to WiFi and pull from RPi
-  if (!settingsRetrieved ) {
+  if (!config.configFromPi) {
     sendESPNOWMQTT("boot", "getting Settings from Pi");
     initWiFi();
     // check if WiFi is connected, otherwise, goto sleep and try again in 15 minutes!
     if (WiFi.status() != WL_CONNECTED) {
-     gotoSleepForSeconds(15*60, "Wifi failed to connect, trying again in 15 minutes");
+     gotoSleepForSeconds(15*60, "Wifi failed to connect, trying again in 15 minutes", SLEEP_MODE_FULL_WAKE_POLL);
     }
   }
   digitalWrite(LED, HIGH); // turn LED offf
@@ -288,6 +336,14 @@ digitalWrite(LED, LOW);
     updateConfigFromPi();
     getConfigFromPiMillis = millis() - getConfigFromPiMillis;
     ESPNOWSetRetryLimit(config.espNowRetries); // in case it has changed!
+    if (config.configFromPi) {
+        Serial.println("After updating config from Pi");
+        printConfig();
+    }
+    else {
+      Serial.println("WARNING: Updating config from Pi failed!");
+      printConfig();
+    }
   }
 
 
@@ -295,13 +351,13 @@ digitalWrite(LED, LOW);
 // always do the short sleep thingy if settings *ARE* retrieved
 // if wifi is not connected, OR settings aren't retreived we will proceed with the built in settings
 // aka ??? minutes
-  if (WiFi.status() == WL_CONNECTED && settingsRetrieved ) {
-//  if (WiFi.status() == WL_CONNECTED && WiFi.channel() != ESPNOW_CHANNEL && settingsRetrieved ) {
-    Serial.printf("doing a FAST sleep to reinitialize ESP NOW, settingsRetrieved:%d, channel:%d\n", settingsRetrieved , WiFi.channel());
+  if (WiFi.status() == WL_CONNECTED && config.configFromPi) {
+//  if (WiFi.status() == WL_CONNECTED && WiFi.channel() != ESPNOW_CHANNEL && config.configFromPi ) {
+    Serial.printf("doing a FAST sleep to reinitialize ESP NOW, settingsRetrieved:%d, channel:%d\n", config.configFromPi , WiFi.channel());
 
     Serial.println("deep sleeping for 1 second, expect a wakeup");
     delay(100);
-    gotoSleepForSeconds(1,"FastSleep for 1 second on boot to reInitialize WiFi/ESPNow");
+    gotoSleepForSeconds(1,"FastSleep for 1 second on boot to reInitialize WiFi/ESPNow", SLEEP_MODE_FULL_WAKE_POLL);
     Serial.println("Shouldn't reach Here!");
 
     
@@ -309,11 +365,17 @@ digitalWrite(LED, LOW);
     stopESPNow();
     WiFi.setAutoConnect(false);
     WiFi.mode(WIFI_OFF);
+
+    if (config.flushUARTAtEndOfWakeStub) {
+      Serial.flush();
+      delay(1000);
+    }
+    
     esp_sleep_enable_timer_wakeup(1 * uS_TO_S_FACTOR);
     esp_deep_sleep_start();
     // init espnow again
     if (!initESPNOWSenderTo(remoteMac)) {
-      gotoSleepForSeconds(15*60, "ESPNow failed to re-initialize after disconnecting WiFi, trying again in 15 minutes");    
+      gotoSleepForSeconds(15*60, "ESPNow failed to re-initialize after disconnecting WiFi, trying again in 15 minutes", SLEEP_MODE_FULL_WAKE_POLL);    
     };
   }
   Serial.println("Ready to start to report status");
@@ -342,6 +404,7 @@ digitalWrite(LED, LOW);
     sendESPNOWMQTT("lastWakeDurationMs", lastWakeDurationMs);
     sendESPNOWMQTT("bootCount", bootCount);
     sendESPNOWMQTT("cumulativeWakeTimeMs", cumulativeWakeTimeMs);
+    sendESPNOWMQTT("stubCumulativeWakeTimeMicros", stubCumulativeWakeTimeMicros);
     sendESPNOWMQTT("debug/config/sendToThingSpeak", config.sendThingSpeak? "true": "false");
     sendESPNOWMQTT("debug/config/sendToPushover", config.sendPushover? "true": "false");
     sendESPNOWMQTT("debug/config/thingspeakKey", config.thingspeakKey);
@@ -466,7 +529,7 @@ digitalWrite(LED, LOW);
   S.printf("Been awake for %ld millis\n", (millis()- startTimeMillis) );
   S.printf("missing timing points:\n\tN:%d\n\tO:%d\n\tP:%d\n\t(WiFi_OFF)\n\tQ:%d\n\tR:%d\n",
     timingPointN,timingPointO,timingPointP,timingPointQ,timingPointR);
-  gotoSleepForSeconds(config.sleepTimeMins*60, "End of Normal Boot Cycle");
+  gotoSleepForSeconds(config.sleepTimeMins*60, "End of Normal Boot Cycle", config.sleepMode);
 
 // shouldn't reach here!
 
@@ -493,6 +556,11 @@ digitalWrite(LED, LOW);
 
     
   S.printf("Going to sleep now for %d minutes", config.sleepTimeMins);
+  if (config.flushUARTAtEndOfWakeStub) {
+     Serial.flush();
+      delay(1000);
+  }
+
   //Go to sleep now
   unsigned long endTimeMillis = millis();
   if (endTimeMillis > startTimeMillis) { // safe reading
@@ -558,35 +626,9 @@ void setupArduinoOTA() {
 
 }
 
-// #include <driver/adc.h>
-#include <esp_adc_cal.h>
-void readCalibratedMilliVoltsOnA6() {
-      #define V_REF 1100  // ADC reference voltage
-    adc_atten_t attenuation =  ADC_ATTEN_0db; //ADC_ATTEN_11db;
-    // Configure ADC
-    adc1_config_width(ADC_WIDTH_12Bit);
-    adc1_config_channel_atten(ADC1_CHANNEL_6, attenuation);
-
-    // Calculate ADC characteristics i.e. gain and offset factors
-    esp_adc_cal_characteristics_t characteristics;
-    esp_adc_cal_get_characteristics(V_REF, attenuation, ADC_WIDTH_12Bit, &characteristics);
-
-    // Read ADC and obtain result in mV
-    uint32_t voltage = adc1_to_voltage(ADC1_CHANNEL_6, &characteristics);
-    printf("%d mV\n",voltage);
 
 
-        esp_err_t status;
-    status = adc2_vref_to_gpio(GPIO_NUM_25);
-    if (status == ESP_OK){
-        printf("v_ref routed to GPIO\n");
-    }else{
-        printf("failed to route v_ref\n");
-    }
-}
-
-
-int  readBattery() {
+int  readBatteryWithAdjustment() {
   int internalBatReading;
   if (WiFi.status() == 255) {
       btStart();
@@ -596,7 +638,7 @@ int  readBattery() {
   else {
       internalBatReading = rom_phy_get_vdd33();
   }
-  S.printf("Raw internal reading:%d\n", internalBatReading);
+  S.printf("Raw internal battery reading:%d\n", internalBatReading);
   return getInternalVdd33Adjusted(internalBatReading);
 }
 
@@ -611,16 +653,56 @@ int  readBatteryRaw() {
   else {
       internalBatReading = rom_phy_get_vdd33();
   }
-  S.printf("Raw internal reading:%d\n", internalBatReading);
+  S.printf("readBatteryRaw() reading:%d\n", internalBatReading);
   return internalBatReading;
 }
 
 
 
-void updateConfigFromPi() {
+void printConfig() {
+  Serial.printf("Config:\n");
+  Serial.printf("\tconfigFromPi:%s\n",                config.configFromPi ? "true":"false");
+  Serial.printf("\tsendThingSpeak:%s\n",              config.sendThingSpeak ? "true":"false");
+  Serial.printf("\tthingspeakKey:%s\n",               config.thingspeakKey);
+  Serial.printf("\tthingspeakChannel::%s\n",          config.thingspeakChannel);
+  Serial.printf("\tsendPushover:%s\n",                config.sendPushover ? "true":"false");
+  Serial.printf("\tsleepMode:%s\n",                   config.sleepMode == SLEEP_MODE_POLL ? "POLL" : 
+                                                      config.sleepMode == SLEEP_MODE_EXT0 ? "EXT0" : 
+                                                      config.sleepMode == SLEEP_MODE_EXT1 ? "EXT1" : 
+                                                      config.sleepMode == SLEEP_MODE_FULL_WAKE_POLL ? "POLL FULL WAKE" :
+                                                      "UNKNOWN"
+                                                      );
+  Serial.printf("\tsleepTimeMins:%d\n",               config.sleepTimeMins);
+  Serial.printf("\tpollIntervalSecs:%d\n",            config.pollIntervalSecs);
+  Serial.printf("\tlingerSeconds:%d\n",               config.lingerSeconds);
+  Serial.printf("\tespNowRetries:%d\n",               config.espNowRetries); 
+  Serial.printf("\tinPin:%d\n",                       config.inPin);
+  Serial.printf("\toutPin:%d\n",                      config.outPin);
+  Serial.printf("\tinPinMode:%s\n",                   config.inPinMode == INPUT ? "INPUT" : config.inPinMode == INPUT_PULLUP ? "INPUT_PULLUP" : config.inPinMode == INPUT_PULLDOWN ? "INPUT_PULLDOWN" : "UNKNOWN");
+  Serial.printf("\tdebugWakeStub:%s\n",               config.debugWakeStub ? "true":"false");
+  Serial.printf("\tflushUARTAtEndOfWakeStub:%s\n",    config.flushUARTAtEndOfWakeStub ? "true":"false");
+}
+/*
+ * read some config from Pi
+ * mode unset => ext0 + input_pullup              (sleep mode is ext0 + timer)
+ *      EXT0  => default
+ *      STUB  => use wakestub to poll              (sleep mode is just timer)
+ *      POLL  => no wakestub, just check on wakeup (sleep mode is timer only)
+ * sleepTimeMins -> time between FULL Wakeups to report status
+ * pollIntervalSecs -> time between stub wakeups (if enabled by mode=STUB)
+ * inPinMode -> INPUT, INPUT_PULLUP, INPUT_PULLDOWN
+ */
+boolean updateConfigFromPi() {
   // get from raspberry pi
   HTTPClient client;
-  String url = String("http://192.168.11.110:1880/ESP/config?name=") + getShortName();
+  String piName = "192.168.11.110";
+
+//  Serial.println("Trying to find localDomain suffix\n");
+//  const char *localDomain = getLocalDomain();
+//  if (*localDomain != 0) {
+//    piName = String("raspberrypi.") + localDomain;
+//  }
+  String url = String("http://" + piName + ":1880/ESP/config?name=") + getShortName();
   S.printf("Attempting to get config from %s\n", url.c_str());
   client.begin(url.c_str());
   int statusCode = client.GET();
@@ -632,6 +714,7 @@ void updateConfigFromPi() {
   }
   client.end();
 
+
   if (statusCode == 200) {
       DynamicJsonBuffer jsonBuffer;
       JsonObject& root = jsonBuffer.parseObject(payload);
@@ -640,19 +723,49 @@ void updateConfigFromPi() {
        boolean invalid = root["invalid"];
        String thingspeakKey = root["thingspeakKey"];
        String thingspeakChannel = root["thingspeakChannel"];
-       int sleepTimeMins = root["sleepTimeMins"];
-       int lingerSeconds = root["lingerSeconds"];
-       uint16_t espNowRetries = root["espNowRetries"];
+       int sleepTimeMins = config.sleepTimeMins;
+       sleepMode_t mode = config.sleepMode;
        gpio_num_t inPin = config.inPin;
        int inPinMode = config.inPinMode;
+       gpio_num_t outPin = config.outPin;
+       boolean debugWakeStub = config.debugWakeStub;
+       boolean flushUARTAtEndOfWakeStub = config.flushUARTAtEndOfWakeStub;
+
+
+
+      
+       if (root.containsKey("mode")) {
+          String modeStr = root["mode"];
+          if (modeStr == "EXT0") {
+            mode = SLEEP_MODE_EXT0;
+          } else if (modeStr == "POLL") {
+            mode = SLEEP_MODE_POLL;
+          } else {
+            mode = SLEEP_MODE_EXT0;
+          }
+       }
+       if (root.containsKey("sleepTimeMins")) {
+          sleepTimeMins = root["sleepTimeMins"];
+       }
+       
+       int pollIntervalSecs = config.pollIntervalSecs;
+       if (root.containsKey("pollIntervalSecs")) {
+          pollIntervalSecs = root["pollIntervalSecs"];
+       }
+       
+       int lingerSeconds = root["lingerSeconds"];
+       uint16_t espNowRetries = root["espNowRetries"];
+       
        if (root.containsKey("inPin")) {
           inPin = (gpio_num_t) ((int)root["inPin"]);
           S.printf("Setting \"inPin\" to %d\n", inPin);
        } else {
           S.printf("inPin left at default of %d\n", inPin);
        }
+       
        if (root.containsKey("inPinMode")) {
           String inPinModeS = root["inPinMode"];
+          S.printf("inPinMode read as %s\n", inPinModeS.c_str());
           if (inPinModeS == "INPUT_PULLUP") {
             inPinMode = INPUT_PULLUP;
           } else if (inPinModeS == "INPUT_PULLDOWN") {
@@ -666,12 +779,27 @@ void updateConfigFromPi() {
        } else {
           S.printf("inPinMode left at default of %d\n", inPinMode);
        }
+       if (root.containsKey("outPin")) {
+          outPin = (gpio_num_t) ((int)root["outPin"]);
+          S.printf("Setting \"outPin\" to %d\n", outPin);
+       } else {
+          S.printf("outPin left at default of %d\n", outPin);
+       }       
+
+       if (root.containsKey("debugWakeStub")) {
+        debugWakeStub = root["debugWakeStub"];
+       }
+       if (root.containsKey("flushUARTAtEndOfWakeStub")) {
+        flushUARTAtEndOfWakeStub = root["flushUARTAtEndOfWakeStub"];
+       }
 
        
+       // update the config
        S.printf("thingspeak:%d pushover:%d invalid:%d thingspeakKey:%s\n",thingspeak, pushover, invalid, thingspeakKey.c_str() );
        config.sendThingSpeak = thingspeak;
        config.sendPushover = pushover;
        config.sleepTimeMins = sleepTimeMins;
+       config.pollIntervalSecs = pollIntervalSecs;
        if (config.thingspeakKey != NULL) {
          free(config.thingspeakKey);
        }
@@ -680,18 +808,26 @@ void updateConfigFromPi() {
        config.lingerSeconds = lingerSeconds;
        config.espNowRetries = espNowRetries;
        config.inPin = inPin;
-       settingsRetrieved = true;
-  } 
+       config.inPinMode = inPinMode;
+       config.outPin = outPin;
+       config.sleepMode= mode;
+       config.debugWakeStub = debugWakeStub;
+       config.flushUARTAtEndOfWakeStub = flushUARTAtEndOfWakeStub;
+
+       config.configFromPi = true;
+  }  else {
+    
+  }
+  return config.configFromPi;
 }
 
 
 int initWiFi() {
     // get WIFI going...
   
-  //WiFi.setHostname(getName());
   timingPointC = millis();
 
-  Serial.printf("Wifi Status is currently:%d", WiFi.status());
+  Serial.printf("Wifi Status is currently:%d\n", WiFi.status());
 
   if (WiFi.status() == WL_CONNECTED) {
     // we're already connected, just return
@@ -704,12 +840,15 @@ int initWiFi() {
   connectTimeMillis = millis();
   if (staticIP != 0){
     IPAddress ip = IPAddress(staticIP);
-    Serial.print("Using a static IP address to connect\n");
-    Serial.println(ip);
+    Serial.print("Using a static IP address (");
+    Serial.print(ip);
+    Serial.println(") to connect\n");
     WiFi.config(ip, gateway,subnet,dns, dns2); 
   }
 
   WiFi.begin(WIFI_SSID, WIFI_PWD);
+  Serial.printf("Setting hostname to %s\n", getShortName());
+  WiFi.setHostname(getShortName());
   WiFi.setAutoReconnect(0);
 
   timingPointD = millis();
@@ -746,53 +885,258 @@ int initWiFi() {
 }
 
 void handleWiFiFail(char const *msg) {
-    gotoSleepForSeconds(15*60, msg);
+    gotoSleepForSeconds(15*60, msg, SLEEP_MODE_FULL_WAKE_POLL);
 }
 
 
 /** puts into Deep Sleep with appropriate wakeups.
 shuts down as much as is possible.
 */
-void gotoSleepForSeconds(int seconds, char const *reason) {
+void gotoSleepForSeconds(int seconds, char const *reason, sleepMode_t mode) {
       // send a final ESPNow message
       sendESPNOWMQTT("debug/ShuttingDown", reason);
       
       Serial.println(reason);
+
       
       WiFi.setAutoConnect(false);
       WiFi.mode(WIFI_OFF);
       stopESPNow();
-      esp_sleep_enable_timer_wakeup(seconds * uS_TO_S_FACTOR);
-      S.println("Setup ESP32 to sleep for " + String(seconds) +  " Seconds");
-      S.println("Setup ESP32 to sleep for (round tripped)" + String((long)((seconds*uS_TO_S_FACTOR)/uS_TO_S_FACTOR)) + " seconds");
-
-      // also enable on pin High or Low (whichever it ISNT)
       int inReading = digitalRead(config.inPin);
 
-      if (inReading == 0) {
-        S.printf("Enabling wakeup on pin%d HIGH - waiting to trigger when it goes to 1, current value is stored as %d (now is %d)", config.inPin, inReading,  digitalRead(config.inPin));
-        S.println(esp_sleep_enable_ext0_wakeup(config.inPin, 1)); //1 = High, 0 = Low
-      } else {
-        S.printf("Enabling wakeup on pin%d LOW - waiting to trigger when it goes 0, current value is stored as %d (now is %d)", config.inPin,inReading,  digitalRead(config.inPin));
-        S.println(esp_sleep_enable_ext0_wakeup(config.inPin, 0)); //1 = High, 0 = Low
-      }
+      
+      wakeStubDoPreCalculations();
+      debugWakeStub = config.debugWakeStub;
+      flushUARTAtEndOfWakeStub = config.flushUARTAtEndOfWakeStub;
 
-        unsigned long endTimeMillis = millis();
-        if (endTimeMillis > startTimeMillis) { // safe reading
-          lastWakeDurationMs = endTimeMillis - startTimeMillis;
-        } else {
-          lastWakeDurationMs = 0;
-        }
-
-      //Go to sleep now
-      S.println("Going to sleep now");
 
       
+      stubPollTimeSecs = config.pollIntervalSecs;
+      switch (mode) {
+        default:
+        case SLEEP_MODE_FULL_WAKE_POLL :
+        case SLEEP_MODE_EXT0: {
+          esp_sleep_enable_timer_wakeup(seconds * uS_TO_S_FACTOR);
+          S.println("Sleep: FULL|EXT0 Setup ESP32 to sleep for " + String(seconds) +  " Seconds");
+          S.println("Sleep: FULL|EXT0 Setup ESP32 to sleep for (round tripped)" + String((long)((seconds*uS_TO_S_FACTOR)/uS_TO_S_FACTOR)) + " seconds");
+  
+  
+          // also enable on pin High or Low (whichever it ISNT)
+          if (inReading == 0) {
+            S.printf("Sleep: FULL|EXT0 Enabling wakeup on pin%d HIGH - waiting to trigger when it goes to 1, current value is stored as %d (now is %d)", config.inPin, inReading,  digitalRead(config.inPin));
+            S.println(esp_sleep_enable_ext0_wakeup(config.inPin, 1)); //1 = High, 0 = Low
+          } else {
+            S.printf("Sleep: FULL|EXT0 Enabling wakeup on pin%d LOW - waiting to trigger when it goes 0, current value is stored as %d (now is %d)", config.inPin,inReading,  digitalRead(config.inPin));
+            S.println(esp_sleep_enable_ext0_wakeup(config.inPin, 0)); //1 = High, 0 = Low
+          }
+          break;
+        }
+        case SLEEP_MODE_POLL: {
+          // ensure some IO is set to as quiet as possible 
+          S.printf("Sleep:POLL putting pins into INPUT mode\n");
+          if (config.outPin < GPIO_NUM_MAX && config.outPin >= 0) {
+            pinMode(config.outPin, INPUT);
+          }
+          pinMode(config.inPin, INPUT);
+          pinMode(GPIO_NUM_13, INPUT);
+          pinMode(GPIO_NUM_15, INPUT);
+          pinMode(GPIO_NUM_2, INPUT);
+          S.printf("Sleep:POLL stub wakeup in %d secs\n", config.pollIntervalSecs);
+          esp_sleep_enable_timer_wakeup(config.pollIntervalSecs * uS_TO_S_FACTOR);
+          wakeFromStubAt = stubWakeCount + config.sleepTimeMins*60 / config.pollIntervalSecs;
+          S.printf("Sleep: Enabling POLLING wakeup every %u Secs, full wakeup at %u polls\n", config.pollIntervalSecs ,wakeFromStubAt);
+          break;
+        }
+        case SLEEP_MODE_EXT1: {
+          S.printf("SLEEP MODE EXT1 NOT YET IMPLEMENTED\n");
+          break;
+        }
+      } // end switch on mode
+
+      unsigned long endTimeMillis = millis();
+      if (endTimeMillis > startTimeMillis) { // safe reading
+        lastWakeDurationMs = endTimeMillis - startTimeMillis;
+      } else {
+        lastWakeDurationMs = 0;
+      }
+
+      //Go to sleep now
+      S.println("Going to sleep now\n\n\n\n");
+
+//      if (config.flushUARTAtEndOfWakeStub) {
+        Serial.flush();
+//      }
       cumulativeWakeTimeMs += lastWakeDurationMs;
       esp_deep_sleep_start();
 
       
       S.println("Should never reach here!");    
   
+}
+
+#include "soc/soc.h"
+#include "soc/uart_reg.h"
+static RTC_IRAM_ATTR void flushUART() {
+      // Wait for UART to end transmitting.
+      while (REG_GET_FIELD(UART_STATUS_REG(0), UART_ST_UTX_OUT)) { // soc\uart_reg.h
+            ;
+        }
+}// end if waiting for UART to flush
+
+
+RTC_IRAM_ATTR boolean getCurrentState(int sleepMode) {
+/*   
+ do { 
+     static RTC_RODATA_ATTR const char fmt[] = "\tin IRAM getCurrentState\n"; 
+     ets_printf(fmt); 
+     flushUART();
+     } while (0);
+ */    
+   if (config.outPin < GPIO_NUM_0 || config.outPin >= GPIO_NUM_MAX) {
+    // output disabled, just read the in pin
+       return GPIO_INPUT_GET(config.inPin);
+   } else {
+      return arePinsConnected(config.inPin, config.outPin);
+   }
+/** old code
+  switch (sleepMode) {
+    default:
+    case SLEEP_MODE_EXT0:
+    case SLEEP_MODE_EXT1:
+    case SLEEP_MODE_FULL_WAKE_UP:
+       return GPIO_INPUT_GET(config.inPin);
+       ;
+    case SLEEP_MODE_POLL:
+      return arePinsConnected(config.inPin, config.outPin);
+      ;
+  }
+*/  
+}
+
+// returns TRUE for sprung
+boolean getCurrentStateMAIN(int sleepMode) {
+   Serial.printf("getCurrentStateMAIN() inPin %d, outPin %d\n", config.inPin, config.outPin);
+   if (config.flushUARTAtEndOfWakeStub) {
+     Serial.flush();
+   }
+
+   if (config.outPin < GPIO_NUM_0 || config.outPin >= GPIO_NUM_MAX) {
+    // output disabled, just read the in pin
+       return digitalRead(config.inPin);
+   } else {
+      return !arePinsConnectedMAIN(config.inPin, config.outPin);
+   }
+
+/* old code
+  switch (sleepMode) {
+    default:
+    case SLEEP_MODE_EXT0:
+    case SLEEP_MODE_EXT1:
+      Serial.printf("getCurrentStateMAIN() digitalRead pin %d\n", config.inPin);
+      Serial.flush();
+      return digitalRead(config.inPin);
+    case SLEEP_MODE_POLL:
+      Serial.printf("getCurrentStateMAIN() calling arePinsConected\n");
+      Serial.flush();
+      // cant call IRAM code for some reason
+      return arePinsConnectedMAIN(config.inPin, config.outPin);
+  }
+*/  
+}
+
+boolean arePinsConnectedMAIN(gpio_num_t in, gpio_num_t out) {
+  boolean input_and_output_connected = true;
+  int inputState;
+
+  pinMode(out, OUTPUT);
+  digitalWrite(out, 0);
+  inputState = digitalRead(in);
+  Serial.printf("\twith output LOW input is %d\n", inputState);
+
+  if (inputState != 0) {
+    Serial.printf("\tinput and output pins are NOT connected\n");
+    return false;
+  }
+
+  digitalWrite(out, 1);
+  inputState = digitalRead(in);
+  Serial.printf("\tWith output high, input is %d\n", inputState);
+
+  if (inputState != 1) {
+    Serial.printf("\tinput and output pins are NOT connected\n");
+    return false;
+  }
+    
+  Serial.printf("\tinput and output pins are connected\n");
+
+  return true;
+}
+
+/** STUB function, be careful what you call! */
+boolean RTC_IRAM_ATTR  should_stub_wake_fully() {
+  if (wakeFromStubAt <= stubWakeCount) {
+    return true;
+  }
+  // check to see if input and output are connected
+  boolean currentState = getCurrentState(config.sleepMode);
+  if (lastPinsConnectedState == currentState) {
+    return false;
+  }
+  lastPinsConnectedState = currentState;
+  return true;
+  
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//              getLocalDomain                                               //
+//  returns .lan, .home, .local or an empty char *!                          //
+///////////////////////////////////////////////////////////////////////////////
+static char const *getLocalDomain() {
+  char const *testDomainNames[] = {".home",  ".lan", ".local"};
+    if (WiFi.status() != WL_CONNECTED) {
+      return "";
+    }
+    // could have potentially used wifi_station_get_hostname() in user_interface.h
+#ifdef ESP8266    
+    const char   *hostname = strdup(WiFi.hostname().c_str());
+#else
+  const char   *hostname = strdup(WiFi.getHostname());
+#endif
+    Serial.printf("getLocalDomain my Hostname is %s\n",hostname);
+
+
+    // find sizeof string to allocate for the lookup
+    int maxDomainNameLength = 0;
+    for (int i=0;i<sizeof(testDomainNames) / sizeof(testDomainNames[0]); i++) {
+      if (maxDomainNameLength  < strlen(testDomainNames[i])) {
+        maxDomainNameLength = strlen(testDomainNames[i]);
+      }
+    }
+
+//Serial.printf("allocSize is %d\n", 1 + maxDomainNameLength + strlen(hostname));
+    char *tstFQDN = (char  *)calloc(2 + maxDomainNameLength + strlen(hostname), sizeof(char));
+    IPAddress throwAway;
+    char const *domainName = NULL;
+
+    for (int i=0;i<sizeof(testDomainNames) / sizeof(testDomainNames[0]); i++) {
+      sprintf(tstFQDN,"%s%s", hostname, testDomainNames[i]);
+      Serial.printf("looking up %s\n", tstFQDN);
+      int retCode = WiFi.hostByName(tstFQDN, throwAway);
+      if (retCode == 1) {
+        Serial.printf("look up of %s successful\n", tstFQDN);
+        domainName = testDomainNames[i];
+        break;
+      }
+      Serial.printf("look up of %s failed\n", tstFQDN);
+    }
+//Serial.printf("testing is complete\n");
+    free(tstFQDN);
+#ifdef ESP8266    
+    free(hostname);
+#endif
+    if (domainName == NULL) {
+      domainName = "";
+    }
+    return domainName;    
 }
 

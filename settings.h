@@ -16,3 +16,7 @@
 #define SEND_PUSHOVER 1
 
 #define ESP_NOW_RETRY_LIMIT 1
+
+extern RTC_DATA_ATTR int bootCount;
+extern RTC_DATA_ATTR int stubWakeCount;
+
